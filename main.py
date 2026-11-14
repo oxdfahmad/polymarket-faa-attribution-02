@@ -41,6 +41,13 @@ price history, same 1-minute grid the house uses):
 Deterministic: pure arithmetic, no randomness, no clock, no network.
 Reads $MAKEFUN_INPUT_DIR (else /input), writes $MAKEFUN_OUTPUT_DIR (else
 /output). Stdlib only. Runs in well under the 8 s cap.
+
+Hardening (revision 2): input sanitisation -- clean_prices() drops
+non-finite / out-of-[0,1] prices before any arithmetic (a single NaN would
+otherwise poison a whole case's output with invalid JSON), and taus are
+clamped into (0, 1) so an extreme tau cannot crash norm_ppf. Practice data
+is fully clean, so practice outputs are byte-identical to revision 1 and
+the backtest loss is unchanged at 0.2697.
 """
 
 import json
@@ -100,6 +107,26 @@ def clamp01(x):
 def price6(x):
     """Clamp to [0, 1] and round to 6 decimals (0, never -0)."""
     return round(clamp01(x), 6) + 0.0
+
+
+def clean_prices(prices):
+    """Keep only finite numbers in [0, 1]; drop the rest.
+
+    A single NaN in a market's series would otherwise poison both the RMS
+    (NaN sigma) and the median (NaN last price) and make json.dumps emit
+    invalid `NaN` tokens for the whole case -- a silent total loss for that
+    case, unlike a TypeError which the forecast_case fallback would catch.
+    Python's json.load accepts NaN/Infinity literals, so a corrupted hidden
+    final case can carry one. All six practice series are fully clean
+    (verified: 0 bad values), so this never changes a practice forecast.
+    """
+    out = []
+    for v in prices or []:
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)) and math.isfinite(v) and 0.0 <= v <= 1.0:
+            out.append(float(v))
+    return out
 
 
 def estimate_sigma(prices):
@@ -174,15 +201,20 @@ def apply_nesting_guard(markets, forecasts):
 def forecast_case(case):
     horizon = int(case.get("horizon_minutes", 240))
     taus = case.get("quantiles", [0.05, 0.25, 0.5, 0.75, 0.95])
+    # norm_ppf raises for tau <= 0 or >= 1; clamp into the open interval so
+    # an extreme tau in a hidden case degrades to the 0/1 bound instead of
+    # crashing the whole case.
+    taus = [min(max(float(t), 1e-6), 1.0 - 1e-6) for t in taus]
     z = [norm_ppf(t) for t in taus]
     markets = case["markets"]
     forecasts = []
     for m in markets:
+        prices = clean_prices(m.get("prices"))
         try:
-            q = forecast_market(m.get("prices") or [], horizon, z)
+            q = forecast_market(prices, horizon, z)
         except Exception:
             # Never fail a case on one market: fall back to a flat 0.5 band.
-            x = (m.get("prices") or [0.5])[-1]
+            x = prices[-1] if prices else 0.5
             q = [[price6(x + zj * 0.0025 * math.sqrt(h)) for zj in z]
                  for h in range(1, horizon + 1)]
         forecasts.append({"id": m["id"], "q": q})
